@@ -1,7 +1,5 @@
 # Recopilatorio de examenes de laboratorio individual - IISSI1
 
-> Generado a partir del repositorio [examenes-lab-individual](https://github.com/IISSI1-IS-2025/examenes-lab-individual) (rama `main` excluida por ser la plantilla base) mas un examen adicional aportado aparte. Cada seccion se corresponde con un examen; bajo cada apartado del enunciado se incluye el codigo de la solucion correspondiente cuando esta disponible. Las secciones de procedimiento de entrega/revision se han omitido por no ser parte del enunciado del ejercicio.
-
 ## Indice
 
 - [Modelo A](#modelo-a)
