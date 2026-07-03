@@ -9,6 +9,7 @@
 - [Modelo C](#modelo-c)
 - [Segunda Convocatoria (Julio)](#segunda-convocatoria-julio)
 - [Tercera Convocatoria (Octubre)](#tercera-convocatoria-octubre)
+- [Examen Enero (Lab4)](#examen-enero-lab4)
 
 ---
 
@@ -1302,5 +1303,323 @@ BEGIN
         SET MESSAGE_TEXT = 'El pedido no puede incluirse en ningún envío por no contener productos físicos.';
    END IF;
 END //
+DELIMITER ;
+```
+
+---
+
+# Examen Enero (Lab4)
+
+*(fuente: paquete `enero.zip` subido por el usuario — evaluación individual de laboratorio "IS Lab4 - Dic/2025"; no corresponde a una rama del repositorio `examenes-lab-individual`, sino a un examen adicional)*
+
+> **Nota:** los ficheros de solución incluidos en el paquete original (`1.solucionCreacionTabla.sql`, `2.solucionConsultas.sql`, `3.solucionProcedimientos.sql`, `4.solucionTriggers.sql`) contienen un intento propio del alumno con varios errores de sintaxis y de lógica (p. ej. `ALTER TABLE Productos( ... )` con paréntesis mal cerrados, referencias a columnas inexistentes como `u.id`/`u.direccion` cuando la tabla usa `uId`/`direccionEnvio`, variables no declaradas en el procedimiento como `p_fechaRealizacion`/`p_direccion`, `USE DATABASE` en vez de `USE`, y un `UPDATE ... WHERE id = 1 AND id = 2 AND id = 3` que nunca puede cumplirse por combinar `AND` sobre la misma columna). Las soluciones que aparecen a continuación son una propuesta corregida y verificada manualmente contra un MariaDB real, no un fichero oficial del profesor.
+
+**Antes de la entrega debe ser identificado por el Profesor.**
+
+## 🛒 Tienda Online (PedidosOnLine)
+
+Partiendo de la `PedidosOnLine` vista durante los laboratorios, con el siguiente modelado conceptual y extensión relacional:
+
+```java
+Productos (pId:int, producto:string, descripcion:string, precioProducto, puedeVenderseAMenores, tipo:('Físico','Digital'))
+  PK(pId)
+
+Usuarios (uId:int,  usuario:string, contraseña:string, fechaNacimiento:date, /edad:int,
+        esEmpleado:boolean, salario:money, -- Empleados
+        esCliente:boolean,direccionEnvio:string, codigoPostal:string -- Clientes
+)
+  PK(uId)
+
+Pedidos (pdId:int, c_uId:int, e_uId:int, direccionEntrega:string, fechaRealizacion:date, fechaEnvio:date, /importePedido:money)
+  PK(pdId)
+  FK_Cliente(c_uId)/Usuarios
+  FK_Empleado(e_uId)/Usuarios
+
+LineasPedido (pdId:int, pId:int, unidades:int, precioLinea:money, /importeLinea:money )
+  PK(pdId, pId)
+  FK_Pedidos(pdId)/Pedidos
+  FK_Productos(pId)/Productos
+```
+
+El esquema relacional SQL MariaDB y los datos de prueba iniciales se encuentran en `0.a_createDB.sql` y `0.b_populate.sql`.
+
+## ❓ Nuevos Requisitos: Gestión de Garantías Post-Venta
+
+Se requiere modificar la base de datos para incorporar la gestión de garantías post-venta de productos.
+
+### 1. (+1,5) Plazo, Garantía Básica, Garantía Extendida
+
+#### 1.1. RI (+0,5). Plazo de Garantía
+
+El plazo de garantía (`plazoGarantia`) de cada producto se expresa en número entero de meses. Un producto tiene el mismo plazo en cualquier transacción (pedido de venta).
+
+#### 1.2. RI, RN (+1). Tipo de Garantía
+
+La Garantía Básica es de 1 a 2 años. La Garantía Extendida de 2 a 5 años. No se admiten otros valores. Derive automáticamente el dato booleano `garantiaExtendida`.
+
+**Solución propuesta (`1.solucionCreacionTabla.sql`):**
+
+```sql
+USE PedidosOnLine;
+
+-- 1.1: plazoGarantia es un atributo del Producto (mismo plazo en cualquier transacción),
+--      admite NULL para los productos que no tienen garantía.
+-- 1.2: solo se admiten valores entre 12 y 60 meses (1 a 5 años); garantiaExtendida se deriva
+--      automáticamente: FALSE entre 12-23 meses (básica), TRUE entre 24-60 meses (extendida).
+ALTER TABLE Productos
+    ADD COLUMN plazoGarantia INT DEFAULT NULL,
+    ADD CONSTRAINT ck_plazoGarantia_rango
+        CHECK (plazoGarantia IS NULL OR plazoGarantia BETWEEN 12 AND 60),
+    ADD COLUMN garantiaExtendida BOOLEAN AS (
+        CASE
+            WHEN plazoGarantia IS NULL THEN NULL
+            WHEN plazoGarantia >= 24 THEN TRUE
+            ELSE FALSE
+        END
+    ) VIRTUAL;
+```
+
+### 2. (+4) Aplicación de la garantía a un producto
+
+La garantía entra en vigor para los productos incluidos en un pedido de venta, iniciándose en el momento del envío (`fechaEnvio`). Se evitan datos redundantes y las modificaciones dejan el esquema en 3FN.
+
+#### 2.1. (+2, Trigger). Derivación de `fFinGarantia`
+
+La fecha de finalización de la garantía (`fFinGarantia`) debe derivarse al aplicar a la entrada en vigor el `plazoGarantia` del producto.
+
+**Solución propuesta (`4.solucionTriggers.sql`, parte 1):**
+
+`fFinGarantia` depende de datos de otras dos tablas (`Pedidos.fechaEnvio` y `Productos.plazoGarantia`), así que no puede expresarse como columna `GENERATED`/`VIRTUAL` (estas solo pueden referenciar columnas de la propia fila). Se mantiene como columna almacenada en `LineasPedido` y se deriva mediante triggers, evitando que el dato pueda introducirse manualmente de forma inconsistente:
+
+```sql
+USE PedidosOnLine;
+
+ALTER TABLE LineasPedido
+    ADD COLUMN fFinGarantia DATE DEFAULT NULL;
+
+DELIMITER //
+
+-- Caso 1: la línea se inserta cuando el pedido YA tiene fechaEnvio (envío inmediato)
+DROP TRIGGER IF EXISTS t_lineaspedido_derivar_ffingarantia_bi //
+CREATE TRIGGER t_lineaspedido_derivar_ffingarantia_bi
+BEFORE INSERT ON LineasPedido
+FOR EACH ROW
+BEGIN
+    DECLARE v_fechaEnvio DATE;
+    DECLARE v_plazoGarantia INT;
+
+    SELECT fechaEnvio INTO v_fechaEnvio FROM Pedidos WHERE pdId = NEW.pdId;
+    SELECT plazoGarantia INTO v_plazoGarantia FROM Productos WHERE pId = NEW.pId;
+
+    IF v_fechaEnvio IS NOT NULL AND v_plazoGarantia IS NOT NULL THEN
+        SET NEW.fFinGarantia = DATE_ADD(v_fechaEnvio, INTERVAL v_plazoGarantia MONTH);
+    ELSE
+        SET NEW.fFinGarantia = NULL;
+    END IF;
+END //
+
+-- Caso 2: el pedido se crea sin fechaEnvio y esta se rellena más tarde -> hay que
+-- retro-derivar fFinGarantia en las líneas ya existentes de ese pedido
+DROP TRIGGER IF EXISTS t_pedidos_derivar_ffingarantia_au //
+CREATE TRIGGER t_pedidos_derivar_ffingarantia_au
+AFTER UPDATE ON Pedidos
+FOR EACH ROW
+BEGIN
+    IF OLD.fechaEnvio IS NULL AND NEW.fechaEnvio IS NOT NULL THEN
+        UPDATE LineasPedido lp
+        JOIN Productos pr ON lp.pId = pr.pId
+        SET lp.fFinGarantia = DATE_ADD(NEW.fechaEnvio, INTERVAL pr.plazoGarantia MONTH)
+        WHERE lp.pdId = NEW.pdId AND pr.plazoGarantia IS NOT NULL;
+    END IF;
+END //
+
+DELIMITER ;
+```
+
+#### 2.2. (+1, Trigger). Protección de `fFinGarantia`
+
+La fecha `fFinGarantia` NO ES MODIFICABLE. Debe quedar protegida ante cambios.
+
+**Solución propuesta (`4.solucionTriggers.sql`, parte 2):**
+
+El trigger permite el paso de `NULL` a un valor (la derivación inicial hecha por los triggers anteriores), pero bloquea cualquier intento posterior de modificar un valor ya fijado:
+
+```sql
+DELIMITER //
+
+DROP TRIGGER IF EXISTS t_lineaspedido_proteger_ffingarantia_bu //
+CREATE TRIGGER t_lineaspedido_proteger_ffingarantia_bu
+BEFORE UPDATE ON LineasPedido
+FOR EACH ROW
+BEGIN
+    IF OLD.fFinGarantia IS NOT NULL
+       AND (NEW.fFinGarantia IS NULL OR NEW.fFinGarantia <> OLD.fFinGarantia) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'La fecha de fin de garantía no se puede modificar';
+    END IF;
+END //
+
+DELIMITER ;
+```
+
+#### 2.3. (+1, RN). Derivación de `garantiaVencida`
+
+Cuando la fecha actual supere a `fFinGarantia`, el producto de ese pedido se considera con garantía vencida o caducada. Derive el dato booleano `garantiaVencida` en esa situación.
+
+**Solución propuesta (`0.d_views & triggers.sql`):**
+
+`garantiaVencida` depende de `CURDATE()`, una función no determinista, por lo que MariaDB no permite usarla en una columna `GENERATED`/`VIRTUAL`. Para no almacenar un dato redundante (y potencialmente desactualizado) se deriva en una vista:
+
+```sql
+USE PedidosOnLine;
+
+CREATE OR REPLACE VIEW v_garantiasLineasPedido AS
+SELECT
+    lp.pdId,
+    lp.pId,
+    lp.fFinGarantia,
+    (CURDATE() > lp.fFinGarantia) AS garantiaVencida
+FROM LineasPedido lp
+WHERE lp.fFinGarantia IS NOT NULL;
+```
+
+### 3. (+0,5) Ajuste del Populate
+
+Genere una versión nueva del populate en SQL que contenga productos y pedidos con garantías. Incluya productos con y sin garantía, con garantía básica y extendida. Incluya líneas de pedido con garantía en vigor y con garantía vencida.
+
+**Solución propuesta (`0.b_populate.sql`):**
+
+```sql
+USE PedidosOnLine;
+SET FOREIGN_KEY_CHECKS=0;
+TRUNCATE LineasPedido;
+TRUNCATE Pedidos;
+TRUNCATE Productos;
+TRUNCATE Usuarios;
+SET FOREIGN_KEY_CHECKS=1;
+
+-- Usuarios
+INSERT INTO Usuarios (esCliente,esEmpleado,email, contraseña, usuario, salario, direccionEnvio, codigoPostal, fechaNacimiento) VALUES
+(TRUE,FALSE,'cliente1@example.com', 'password123', 'Cliente Uno', NULL, '123 Calle Principal', '28001', '2005-03-25'),
+(FALSE,TRUE,'empleado1@example.com', 'password123', 'Empleado Dos', 35000, NULL, NULL, '2008-07-15'),
+(TRUE,FALSE,'cliente2@example.com', 'password123', 'Cliente Tres', NULL, '456 Avenida Secundaria', '28002', '2008-07-15'),
+(TRUE,TRUE,'clienteEmpleado@example.com', 'password123', 'Cliente & Empleado', 40000, '456 Avenida Secundaria', '28002', '2008-07-15');
+
+-- Productos: con y sin garantía, básica (12-23 meses) y extendida (24-60 meses)
+INSERT INTO Productos (producto, descripción, precioProducto, tipoProducto, puedeVenderseAMenores, plazoGarantia) VALUES
+('Smartphone', 'Teléfono inteligente de última generación', 699.99, 'Físico', TRUE, 24),   -- Extendida
+('Laptop', 'Portátil con características avanzadas', 1200.00, 'Físico', TRUE, 36),          -- Extendida
+('Libro Electrónico', 'Libro descargable en formato PDF', 9.99, 'Digital', TRUE, NULL),      -- Sin garantía
+('Videojuego', 'Videojuego descargable para PC', 59.99, 'Digital', FALSE, NULL),             -- Sin garantía
+('Camiseta', 'Camiseta de algodón', 15.99, 'Físico', TRUE, 12),                              -- Básica
+('Curso Online', 'Acceso a curso en línea sobre programación', 150.00, 'Digital', TRUE, NULL), -- Sin garantía
+('Película', 'Película en formato digital HD', 19.99, 'Digital', FALSE, NULL),               -- Sin garantía
+('Audífonos', 'Audífonos inalámbricos', 29.99, 'Físico', TRUE, 18),                          -- Básica
+('Tableta Gráfica', 'Tableta para diseño gráfico', 85.99, 'Físico', TRUE, 48),                -- Extendida
+('Documental', 'Documental descargable', 12.99, 'Digital', TRUE, NULL);                       -- Sin garantía
+
+-- Pedidos
+INSERT INTO Pedidos (fechaRealizacion, fechaEnvio, direccionEntrega, comentarios, c_uId, e_uId) VALUES
+('2021-10-01', '2021-11-03', '123 Calle Principal', 'Entregar en la puerta', 1, 2),        -- pdId 1
+('2022-11-01', '2022-12-03', '123 Calle Principal', 'Entregar en la puerta', 1, 2),        -- pdId 2
+('2023-12-01', '2023-12-03', '123 Calle Principal', 'Entregar en la puerta', 1, 2),        -- pdId 3
+('2024-12-02', '2024-12-03', '123 Calle Principal', 'Entregar en la puerta', 1, 2),        -- pdId 4
+('2025-01-30', '2025-02-01', '456 Avenida Secundaria', 'Entregar en recepción', 3, NULL);  -- pdId 5
+
+-- LineasPedido: fFinGarantia se rellena solo, vía trigger, al insertar
+INSERT INTO LineasPedido (pdId, pId, unidades, precioLinea) VALUES
+(1, 1, 1, 699.99),   -- Smartphone (24m): fFinGarantia 2023-11-03 -> VENCIDA
+(1, 5, 2, 15.99),    -- Camiseta   (12m): fFinGarantia 2022-11-03 -> VENCIDA
+(1, 3, 1, 9.99),     -- Libro Electrónico: sin garantía -> fFinGarantia NULL
+(1, 4, 10, 9.99),    -- Videojuego: sin garantía -> fFinGarantia NULL
+(4, 1, 1, 699.99),   -- Smartphone (24m): fFinGarantia 2026-12-03 -> VIGENTE
+(4, 5, 2, 15.99),    -- Camiseta   (12m): fFinGarantia 2025-12-03 -> VENCIDA
+(5, 8, 1, 29.99),    -- Audífonos  (18m): fFinGarantia 2026-08-01 -> VIGENTE, vence en <2 meses
+(5, 9, 50, 85.99);   -- Tableta Gráfica (48m): fFinGarantia 2029-02-01 -> VIGENTE
+```
+
+### 4. (+1) Q1 Consulta SQL (DQL)
+
+Para todos los clientes, si tienen productos con garantías que vencerán en los próximos dos meses, listar: código cliente, nombre, número de pedido, fecha de envío del pedido (inicio de la garantía), código de producto y fecha fin garantía.
+
+**Solución propuesta (`2.solucionConsultas.sql`):**
+
+```sql
+USE PedidosOnLine;
+
+SELECT
+    u.uId          AS codigoCliente,
+    u.usuario      AS nombreCliente,
+    p.pdId         AS numeroPedido,
+    p.fechaEnvio   AS fechaEnvio,
+    pr.pId         AS codigoProducto,
+    lp.fFinGarantia
+FROM Usuarios u
+JOIN Pedidos p       ON p.c_uId = u.uId
+JOIN LineasPedido lp ON lp.pdId = p.pdId
+JOIN Productos pr    ON pr.pId = lp.pId
+WHERE u.esCliente = TRUE
+  AND lp.fFinGarantia IS NOT NULL
+  AND lp.fFinGarantia BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 2 MONTH);
+```
+
+### 5. (+3) Procedure `p_i_garantiaExt()`
+
+#### 5.1. (+2). Procedure
+
+Para un cliente (parámetro), genere un pedido en el día de hoy, con fecha de envío tres días después, que contenga líneas para todos los productos con garantía extendida.
+
+#### 5.2. (+1). Transacción
+
+Trate las modificaciones a la BD como una transacción: o bien se genera el pedido y todas las líneas, o bien, si salta alguna excepción, no se modifica la BD.
+
+**Solución propuesta (`3.solucionProcedimientos.sql`):**
+
+```sql
+USE PedidosOnLine;
+
+DELIMITER //
+
+DROP PROCEDURE IF EXISTS p_i_garantiaExt //
+CREATE PROCEDURE p_i_garantiaExt (IN p_clienteId INT)
+BEGIN
+    DECLARE v_existeCliente INT;
+    DECLARE v_direccion VARCHAR(100);
+    DECLARE v_nuevoPedidoId INT;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    -- Validación previa: el cliente debe existir y ser cliente (no abre transacción todavía)
+    SELECT COUNT(*), MAX(direccionEnvio)
+    INTO v_existeCliente, v_direccion
+    FROM Usuarios
+    WHERE uId = p_clienteId AND esCliente = TRUE;
+
+    IF v_existeCliente = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El cliente indicado no existe';
+    END IF;
+
+    START TRANSACTION;
+
+    -- 1. Crear el pedido (fecha de hoy, envío dentro de 3 días)
+    INSERT INTO Pedidos (fechaRealizacion, fechaEnvio, direccionEntrega, comentarios, c_uId)
+    VALUES (CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), v_direccion, 'Pedido de garantía extendida', p_clienteId);
+
+    SET v_nuevoPedidoId = LAST_INSERT_ID();
+
+    -- 2. Una línea por cada producto con garantía extendida
+    --    (fFinGarantia se deriva automáticamente vía trigger al insertar)
+    INSERT INTO LineasPedido (pdId, pId, unidades, precioLinea)
+    SELECT v_nuevoPedidoId, pId, 1, precioProducto
+    FROM Productos
+    WHERE garantiaExtendida = TRUE;
+
+    COMMIT;
+END //
+
 DELIMITER ;
 ```
